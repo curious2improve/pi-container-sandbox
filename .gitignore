@@ -1,0 +1,13 @@
+# Real sandbox environment file (contains endpoint/credential values).
+config/sandbox.env
+
+# Host directory bind-mounted read-write as the complete agent home
+# (/home/agent) in the sandbox. It holds live Pi state (.pi/: sessions,
+# auth, settings), tool config, package caches, and possibly credentials
+# the developer deliberately placed there - must never be committed.
+home-agent/*
+!home-agent/README.md
+!home-agent/.pi/agent/models.json
+
+# macOS
+.DS_Store

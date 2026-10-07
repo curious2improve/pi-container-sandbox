@@ -1,0 +1,22 @@
+{
+  "providers": {
+    "splash": {
+      "baseUrl": "http://host.container.internal:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "splash",
+      "models": [
+        {
+          "id": "incoai/Qwen3.8-27B-Splash",
+          "name": "Qwen3.8 27B via Splash",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "contextWindow": 131072,
+          "maxTokens": 8192
+        }
+      ]
+    }
+  }
+}

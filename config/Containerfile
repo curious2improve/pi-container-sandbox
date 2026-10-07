@@ -1,0 +1,208 @@
+# syntax note: built and run exclusively with Apple's native `container` CLI.
+# Do not build or run this with Docker/Podman/Colima/OrbStack.
+#
+# Target: linux/arm64 only. Rosetta is never enabled for this image, and no
+# x86_64 packages are installed.
+FROM debian:trixie-slim
+
+# ---------------------------------------------------------------------------
+# Build arguments.
+#
+# Nothing in this image is version-pinned. Every build installs the newest
+# Debian packages, npm packages, and PyPI packages available at build time;
+# use `pcs build --no-cache --pull` (or `--release`) to re-resolve
+# everything against the current package indexes.
+#
+# NODE_MAJOR selects the Node.js *major series* served by the NodeSource
+# repository. This is a series selector, not a package version: APT still
+# resolves the newest release within that series. The series is declared
+# because the Pi agent requires Node.js >= 22 while Debian Trixie's own
+# `nodejs` package is older.
+# ---------------------------------------------------------------------------
+ARG NODE_MAJOR=24
+ARG PI_PACKAGE=@earendil-works/pi-coding-agent
+
+# Runtime user: unprivileged, fixed UID/GID. Host bind mounts (the project
+# folder at /workspace and the whole agent home, home-agent/, at
+# /home/agent) resolve to this user, so everything under /home/agent
+# (dotfiles, .pi, package caches, tool config) persists on the host between
+# sessions while the image root stays read-only.
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
+ARG AGENT_USER=agent
+ARG AGENT_HOME=/home/agent
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    AGENT_HOME=${AGENT_HOME} \
+    PATH="/opt/venv/bin:${AGENT_HOME}/.npm-global/bin:${AGENT_HOME}/.local/bin:/usr/local/bin:${PATH}"
+
+# ---------------------------------------------------------------------------
+# Base OS packages. --no-install-recommends keeps the image minimal and
+# layers deterministic. APT metadata is purged in the same layer.
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        bat \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        diffutils \
+        dnsutils \
+        fd-find \
+        ffmpeg \
+        file \
+        fzf \
+        git \
+        git-delta \
+        gh \
+        glow \
+        gnupg \
+        htop \
+        iproute2 \
+        jq \
+        less \
+        lsof \
+        make \
+        man-db \
+        netcat-openbsd \
+        ninja-build \
+        openssh-client \
+        patch \
+        pkg-config \
+        pipx \
+        procps \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        ripgrep \
+        rsync \
+        shellcheck \
+        shfmt \
+        strace \
+        tini \
+        tmux \
+        tree \
+        unzip \
+        wget \
+        xz-utils \
+        yq \
+        zip \
+    # Debian's 'bat' package (source: shark) ships the binary as 'batcat';
+    # expose it as 'bat' too, the name tools (and the files-widget extension) expect.
+    && ln -sf /usr/bin/batcat /usr/local/bin/bat \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Node.js via NodeSource's Debian Trixie / ARM64 repository. No nvm, no
+# dependency on host Node. Major series selected via NODE_MAJOR build arg
+# (APT still resolves the newest release within that series).
+# ---------------------------------------------------------------------------
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
+
+# ---------------------------------------------------------------------------
+# Runtime user. Pi and all tooling run as this user; the image never
+# defaults to root.
+# ---------------------------------------------------------------------------
+RUN groupadd --gid "${AGENT_GID}" "${AGENT_USER}" \
+    && useradd --uid "${AGENT_UID}" --gid "${AGENT_GID}" --create-home \
+        --home-dir "${AGENT_HOME}" --shell /bin/bash "${AGENT_USER}" \
+    && mkdir -p /workspace "${AGENT_HOME}/.npm-global" "${AGENT_HOME}/.npm" \
+        "${AGENT_HOME}/.cache/pip" "${AGENT_HOME}/.pi" \
+    && chown -R "${AGENT_UID}:${AGENT_GID}" /workspace "${AGENT_HOME}"
+
+# Global npm installs land under the agent's home, not /usr, so the
+# unprivileged user can manage its own global packages.
+RUN npm config set prefix "${AGENT_HOME}/.npm-global"
+
+# ---------------------------------------------------------------------------
+# Pi coding agent: package name is a build arg, version is intentionally not
+# pinned — always the newest release from the npm registry at build time.
+# ---------------------------------------------------------------------------
+RUN npm install -g "${PI_PACKAGE}" \
+    && npm cache clean --force
+
+# ---------------------------------------------------------------------------
+# Node-based developer tools, always latest.
+# ---------------------------------------------------------------------------
+RUN npm install -g \
+        eslint \
+        prettier \
+        typescript \
+        typescript-language-server \
+    && npm cache clean --force
+
+# ---------------------------------------------------------------------------
+# Python virtual environment at /opt/venv. Never use pip
+# --break-system-packages against the system interpreter.
+# ---------------------------------------------------------------------------
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/venv/bin/pip install --no-cache-dir \
+        black \
+        mypy \
+        pytest \
+        ruff \
+    && chown -R "${AGENT_UID}:${AGENT_GID}" /opt/venv
+
+RUN chown -R "${AGENT_UID}:${AGENT_GID}" "${AGENT_HOME}/.npm-global"
+
+USER agent
+
+# ---------------------------------------------------------------------------
+# uv is not available as a Debian package, so it is installed from PyPI via
+# pipx. Running this as the agent user (pipx is on the system PATH) puts the
+# venv and the `uv` shim under ${AGENT_HOME}/.local, which is on PATH and
+# writable by the agent, mirroring the global npm layout.
+# ---------------------------------------------------------------------------
+RUN pipx install uv
+
+WORKDIR /workspace
+
+# Print toolchain versions at build time so drift is visible in build logs.
+RUN echo "--- toolchain versions ---" \
+    && node --version && npm --version \
+    && python3 --version && /opt/venv/bin/python --version \
+    && git --version && curl --version | head -1 \
+    && ffmpeg -version | head -1 \
+    && /opt/venv/bin/ruff --version && /opt/venv/bin/pytest --version \
+    && eslint --version && prettier --version && tsc --version \
+    && pi --version \
+    && uv --version
+
+# ---------------------------------------------------------------------------
+# Agent home template + sandbox entrypoint.
+#
+# At runtime the whole /home/agent is a read-write bind mount of the host's
+# home-agent/ folder, which HIDES everything the image baked into /home/agent
+# (default dotfiles, .pi skeleton, .npm-global, .cache, .local, ...). To keep
+# a first-use host home fully functional, the finished /home/agent is copied
+# here to /usr/local/share/home-agent-template — a path the mount does NOT
+# hide. The entrypoint (copied from config/sandbox-entrypoint.sh) copies the
+# template into the mounted home exactly once on first start (cp -an, never
+# overwriting host customizations; tracked via .sandbox-home-initialized).
+# The template directory is created as root (agent cannot write
+# /usr/local/share); the copy runs as the agent user so every file ends up
+# owned by UID 1000.
+# ---------------------------------------------------------------------------
+COPY --chmod=0755 config/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
+USER root
+RUN mkdir -p /usr/local/share/home-agent-template \
+    && chown 1000:1000 /usr/local/share/home-agent-template
+USER agent
+RUN cp -a "${AGENT_HOME}/." /usr/local/share/home-agent-template/
+
+# tini is PID 1 so signals and zombie processes are handled correctly for
+# long-running Pi sessions and spawned subprocesses; it execs the sandbox
+# entrypoint, which seeds the agent home once and then launches the command
+# ("pi" -> pi in /workspace, "shell" -> bash in /workspace, anything else
+# runs as-is). See config/sandbox-entrypoint.sh.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sandbox-entrypoint.sh"]
+CMD ["pi"]

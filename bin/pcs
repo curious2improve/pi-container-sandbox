@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# pcs — Pi Container Sandbox: the single entry point for all sandbox tooling.
+#
+# Usage: pcs <subcommand> [options]
+#
+# Every subcommand accepts -h, --help for its own options. Run 'pcs help'
+# (or 'pcs help <subcommand>') to list or describe subcommands.
+#
+# Subcommand implementations live in bin/lib/cmd_*.sh and are sourced below;
+# each file defines pcs_cmd_<name>() plus pcs_cmd_<name>_usage().
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/lib/common.sh"
+
+for f in "${SCRIPT_DIR}"/lib/cmd_*.sh; do
+  # shellcheck disable=SC1090
+  source "${f}"
+done
+
+pcs_usage() {
+  cat <<'EOF'
+Usage: pcs <subcommand> [options]
+
+Pi Container Sandbox — build and operate the pi Apple Container sandbox.
+
+Subcommands:
+  build             Build the local/pi-dev:trixie sandbox image for linux/arm64.
+  start             Start the sandbox interactively (default: run 'pi' in
+                    /workspace). Use --workspace-source <dir> for the project
+                    folder (mandatory on first use, then persisted).
+  shell             Open a Bash shell in the running (or a temporary) sandbox.
+  status            Print service/image/container/workspace/limits/endpoint
+                    status.
+  logs              Print or follow sandbox logs.
+  stop              Stop the sandbox without touching any data.
+  reset             Destructively remove the container. Never touches
+                    your project folder or home-agent/.
+  verify            Run the full isolation/tooling/workspace/connectivity check battery.
+  help              Show this help, or help for a specific subcommand.
+
+Run 'pcs <subcommand> --help' for subcommand options.
+EOF
+}
+
+# Map a subcommand name (e.g. "import-project") to its function name
+# (pcs_cmd_import_project). Prints the name on success; fails if no such
+# subcommand is implemented.
+pcs_fn_name() {
+  local sub="$1"
+  local fn="pcs_cmd_${sub//-/_}"
+  declare -F "${fn}" >/dev/null || return 1
+  printf '%s\n' "${fn}"
+}
+
+main() {
+  local sub="${1:-help}"
+  local -a rest=()
+  if (( $# > 0 )); then
+    shift
+    rest=("$@")
+  fi
+
+  case "${sub}" in
+    -h|--help|help)
+      if (( ${#rest[@]} == 0 )); then
+        pcs_usage
+        exit 0
+      fi
+      local target="${rest[0]}"
+      if [[ "${target}" == "-h" || "${target}" == "--help" ]]; then
+        pcs_usage
+        exit 0
+      fi
+      local help_fn
+      if help_fn="$(pcs_fn_name "${target}")"; then
+        "${help_fn}_usage"
+        exit 0
+      fi
+      pcs_err "unknown subcommand: ${target}"
+      pcs_usage >&2
+      exit 1
+      ;;
+    *)
+      local fn
+      if ! fn="$(pcs_fn_name "${sub}")"; then
+        pcs_err "unknown subcommand: ${sub}"
+        pcs_usage >&2
+        exit 1
+      fi
+      "${fn}" "${rest[@]}"
+      ;;
+  esac
+}
+
+main "$@"
