@@ -23,7 +23,7 @@ Options:
 Reset vs stop:
   'pcs stop' stops the container only.
   'pcs reset --delete-data' (this command) deletes the container.
-  Your project folder and agent-home-pi/ survive in both cases.
+  Your project folder and home-agent/.pi/ survive in both cases.
 EOF
 }
 
