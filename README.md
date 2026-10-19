@@ -146,6 +146,7 @@ Pi and `pcs verify` read the endpoint from `config/sandbox.env`.
 
 1. Checks `container system dns list`.
 2. If missing, creates a system-wide Apple Container DNS entry `host.container.internal` pointing at a synthetic, non-routable IP that Apple Container maps back to the host’s `127.0.0.1` (`sudo` once; existing mappings are left untouched).
+3. Note: some LLM engines or local proxies may require explicit whitelisting of allowed hosts, e.g. `splash --allowed-host host.container.internal --allowed-host localhost --allowed-host 127.0.0.1` 
 
 Any container can then reach an engine bound to **`127.0.0.1` only** — no `0.0.0.0` binding, no gateway-IP guessing, no port publishing.
 

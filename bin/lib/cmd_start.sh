@@ -49,6 +49,11 @@ image, exactly once (cp -an: existing files are never overwritten; tracked
 via /home/agent/.sandbox-home-initialized). Delete the marker (or the whole
 home-agent/ folder) to force a re-seed.
 
+On every start with the default 'pi' command, the entrypoint also runs
+'pi update' and 'pi update --extensions' first, so pi and its extensions
+are always the newest versions (best-effort: failures never block the
+session).
+
 Before starting, every extension listed in PI_SANDBOX_EXTENSIONS (see
 config/sandbox.env) is checked with 'pi list' inside the image and installed
 with 'pi install' if missing, so a fresh home-agent/ is self-repairing.
@@ -250,8 +255,9 @@ pcs_cmd_start() {
 
   # With no command arguments the image's default CMD ("pi") runs. The image
   # entrypoint (sandbox-entrypoint.sh, behind tini as PID 1) seeds the agent
-  # home once and then cds into /workspace before exec'ing 'pi', so pi
-  # starts in the mounted project folder.
+  # home once, runs 'pi update' and 'pi update --extensions' (best-effort),
+  # and then cds into /workspace before exec'ing 'pi', so pi starts in the
+  # mounted project folder.
 
   pcs_info "starting ${PI_SANDBOX_NAME} (cpus=${PI_SANDBOX_CPUS} memory=${PI_SANDBOX_MEMORY}) workspace=${PCS_WORKSPACE_SOURCE}"
 

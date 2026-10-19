@@ -20,8 +20,10 @@
 #    re-seed.
 #
 # 2. Launch. The command is the container's CMD / first arguments:
-#       - "pi"    -> cd into /workspace (the mounted project folder) and
-#                    exec pi with the remaining arguments
+#       - "pi"    -> run 'pi update' and 'pi update --extensions' (so pi
+#                    and its extensions are always fresh), then cd into
+#                    /workspace (the mounted project folder) and exec pi
+#                    with the remaining arguments
 #       - "shell" -> cd into /workspace and exec bash
 #       - anything else is exec'ed as-is (e.g. "bash -c ...", "pytest")
 #
@@ -60,6 +62,13 @@ fi
 case "${1:-}" in
   pi)
     shift
+    # Keep pi and its installed extensions current on every start.
+    # Best-effort: a failed update (e.g. no network) never blocks the
+    # session, we just continue with the currently installed versions.
+    pi update \
+      || echo "sandbox: 'pi update' failed; continuing with the installed version" >&2
+    pi update --extensions \
+      || echo "sandbox: 'pi update --extensions' failed; continuing with the installed extensions" >&2
     cd /workspace 2>/dev/null || true
     exec pi "$@"
     ;;
