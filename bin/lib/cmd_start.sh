@@ -134,27 +134,78 @@ pcs_host_dns_find_safe_ip() {
   return 1
 }
 
-# Idempotently ensure the host.container.internal -> 127.0.0.1 DNS mapping
-# exists in the Apple Container system. Keeps an existing mapping untouched
-# (avoid changing the endpoint unnecessarily); only creates one when absent,
-# which requires sudo.
+# Idempotently ensure the host.container.internal -> safe localhost IP DNS mapping
+# exists in the Apple Container system.
+#
+# The current synthetic IP is retrieved from macOS DNS configuration using
+# scutil, avoiding direct access to /etc/pf.anchors.
 pcs_ensure_host_dns_mapping() {
-  # Keep an existing mapping. This avoids changing the endpoint unnecessarily.
-  if container system dns list 2>/dev/null | grep -Fq "${PCS_HOST_DNS_NAME}"; then
-    pcs_info "host DNS mapping already present (kept as-is):"
-    container system dns list | grep -F "${PCS_HOST_DNS_NAME}" >&2 || true
-    return 0
-  fi
+  local safe_ip current_ip
+  local mapping_exists=false
 
-  local safe_ip
   if ! safe_ip="$(pcs_host_dns_find_safe_ip)"; then
     pcs_err "no suitable localhost-mapping IP found for ${PCS_HOST_DNS_NAME}."
     pcs_err "Check active VPNs, routes and local interfaces."
     return 1
   fi
 
+  # default is empty
+  current_ip=""
+
+  # Check whether Apple Container knows the container domain.
+  if container system dns list 2>/dev/null |
+      awk 'NR > 1 { print $1 }' |
+      grep -Fxq "${PCS_HOST_DNS_NAME}"; then
+    mapping_exists=true
+
+    # if it exists, extract the currently configured synthetic localhost IP from macOS DNS.
+    current_ip="$(
+      scutil --dns 2>/dev/null |
+        awk -v domain="${PCS_HOST_DNS_NAME}" '
+          $1 == "domain" && $3 == domain {
+            found = 1
+          }
+          found && $1 == "options" {
+            if (match($0, /localhost:[0-9.]+/)) {
+              value = substr($0, RSTART, RLENGTH)
+              sub(/^localhost:/, "", value)
+              print value
+              exit
+            }
+          }
+          found && $1 == "flags" {
+            exit
+          }
+        '
+    )"
+  fi
+
+  if [[ "${mapping_exists}" == true && "${current_ip}" == "${safe_ip}" ]]; then
+    pcs_info "host DNS mapping already correct:"
+    pcs_info "  ${PCS_HOST_DNS_NAME} -> ${current_ip}"
+    return 0
+  fi
+
+  # if it exists and current IP is not empty, then delete it
+  if [[ "${mapping_exists}" == true && "${current_ip}" != "" ]]; then
+    if [[ -n "${current_ip}" ]]; then
+      pcs_info "host DNS mapping is stale:"
+      pcs_info "  current:  ${PCS_HOST_DNS_NAME} -> ${current_ip}"
+      pcs_info "  required: ${PCS_HOST_DNS_NAME} -> ${safe_ip}"
+    else
+      pcs_info "host DNS mapping exists, but its current IP could not be determined."
+      pcs_info "Recreating it using ${safe_ip}."
+    fi
+
+    pcs_info "sudo container system dns delete ${PCS_HOST_DNS_NAME}"
+
+    if ! sudo container system dns delete "${PCS_HOST_DNS_NAME}"; then
+      pcs_err "failed to delete the existing ${PCS_HOST_DNS_NAME} DNS mapping."
+      return 1
+    fi
+  fi
+
   pcs_info "Creating ${PCS_HOST_DNS_NAME} using synthetic IP ${safe_ip} using sudo"
-  # print the actual command we want to run to inform the user
   pcs_info "sudo container system dns create ${PCS_HOST_DNS_NAME} --localhost ${safe_ip}"
 
   if ! sudo container system dns create \
@@ -165,11 +216,12 @@ pcs_ensure_host_dns_mapping() {
   fi
 
   echo "Created mapping:"
-  container system dns list | grep -F "${PCS_HOST_DNS_NAME}" || true
+  container system dns list | grep -Fx "${PCS_HOST_DNS_NAME}" || true
 
   echo
   echo "Container API URL:"
   echo "http://${PCS_HOST_DNS_NAME}:8000/v1"
+
   return 0
 }
 
