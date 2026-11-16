@@ -98,7 +98,7 @@ Every subcommand:
 | Subcommand | Purpose |
 |---|---|
 | `pcs build` | Build and tag `local/pi-dev:trixie` for `linux/arm64`, always resolving dependencies to their newest releases. |
-| `pcs start [--workspace-source <dir>]` | Start interactively (default: `pi` in `/workspace`). `--workspace-source` is mandatory on first use (an existing local folder), then persisted in `config/sandbox.env`; passing it again updates the mapping. If the configured endpoint uses `host.container.internal`, ensures the system-wide DNS mapping (checked via `container system dns list`, created only if missing; `sudo` once). |
+| `pcs start [--workspace-source <dir>]` | Start interactively (default: `pi` in `/workspace`). `--workspace-source` is mandatory on first use (an existing local folder), then persisted in `config/sandbox.env`; passing it again updates the mapping. If the configured endpoint uses `host.container.internal`, checks that the DNS mapping still redirects to the host and updates it only when it does not (`sudo` only for that create or replace). |
 | `pcs shell [--workspace-source <dir>]` | Bash in `/workspace` of the running sandbox, or a temporary one. Same `--workspace-source` semantics as `start`. |
 | `pcs status` | Service / image / container / workspace-source / limits / endpoint. |
 | `pcs logs` | Print or follow sandbox container logs. |
@@ -144,9 +144,10 @@ Pi and `pcs verify` read the endpoint from `config/sandbox.env`.
 
 **Recommended: host-container DNS** (no engine changes). Point `OPENAI_BASE_URL` at `http://host.container.internal:8000/v1`. `./bin/pcs start` then:
 
-1. Checks `container system dns list`.
-2. If missing, creates a system-wide Apple Container DNS entry `host.container.internal` pointing at a synthetic, non-routable IP that Apple Container maps back to the host’s `127.0.0.1` (`sudo` once; existing mappings are left untouched).
-3. Note: some LLM engines or local proxies may require explicit whitelisting of allowed hosts, e.g. `splash --allowed-host host.container.internal --allowed-host localhost --allowed-host 127.0.0.1` 
+1. Reads the current `host.container.internal` address (resolver file, then `scutil --dns`) and checks `container system dns list`.
+2. Leaves the mapping alone when that address is still safe on this network and a connection to it reaches `127.0.0.1` (no `sudo`).
+3. Otherwise creates it, or deletes and recreates it, with `sudo`. A dead packet-filter rule (common after reboot or a network change) keeps the same synthetic IP and only reloads the redirect. A routed or unreadable address is replaced with a new documentation-range IP.
+4. Note: some LLM engines or local proxies may require explicit whitelisting of allowed hosts, e.g. `splash --allowed-host host.container.internal --allowed-host localhost --allowed-host 127.0.0.1` 
 
 Any container can then reach an engine bound to **`127.0.0.1` only** — no `0.0.0.0` binding, no gateway-IP guessing, no port publishing.
 

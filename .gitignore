@@ -9,5 +9,7 @@ home-agent/*
 !home-agent/README.md
 !home-agent/.pi/agent/models.json
 
+node_modules/*
+
 # macOS
 .DS_Store

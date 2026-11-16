@@ -59,38 +59,37 @@ config/sandbox.env) is checked with 'pi list' inside the image and installed
 with 'pi install' if missing, so a fresh home-agent/ is self-repairing.
 
 If the configured endpoint (OPENAI_BASE_URL) uses the synthetic hostname
-host.container.internal, the system-wide Apple Container DNS entry for it is
-checked with 'container system dns list' and created if missing (idempotent;
-requires sudo once). The sandbox still starts if the mapping cannot be
-created; the endpoint will simply be unreachable from inside.
+host.container.internal, the Apple Container DNS entry is checked on every
+start. It is created or replaced only when it is missing, its IP is no longer
+safe on the current network, or the packet-filter redirect to 127.0.0.1 is
+not active (that rule is dropped on reboot and can go stale after a network
+change). sudo is used only for that create or replace. The sandbox still
+starts if the mapping cannot be repaired; the endpoint will simply be
+unreachable from inside.
 EOF
 }
 
-# Returns 0 if the candidate IP is free: not assigned to a local interface,
-# not currently answering on the network, and not covered by a specific
-# (non-default) route.
-pcs_host_dns_is_safe_ip() {
+# Returns 0 when the IP is not assigned to a local interface and is not
+# covered by a specific route out a real interface. A host route via lo0 is
+# acceptable: that is the loopback path, not a network that appeared after
+# changing Wi-Fi or VPN.
+pcs_host_dns_route_ok() {
   local ip="$1"
-  local route_info destination
+  local route_info destination iface
 
-  # Reject an address already assigned to a local interface.
-  if ifconfig | grep -Eq "inet[[:space:]]+${ip//./\\.}([[:space:]]|$)"; then
+  if ifconfig 2>/dev/null | grep -Eq "inet[[:space:]]+${ip//./\\.}([[:space:]]|$)"; then
     return 1
   fi
 
-  # Reject an address currently responding on the network.
-  if ping -q -c 1 -W 100 "$ip" >/dev/null 2>&1; then
-    return 1
-  fi
-
-  # Reject an address covered by a specific route.
-  # A normal "destination: default" route is acceptable.
   route_info="$(route -n get "$ip" 2>/dev/null || true)"
-  destination="$(
-    awk '/destination:/ { print $2; exit }' <<<"$route_info"
-  )"
+  destination="$(awk '/destination:/ { print $2; exit }' <<<"${route_info}")"
+  iface="$(awk '/interface:/ { print $2; exit }' <<<"${route_info}")"
 
-  case "$destination" in
+  if [[ "${iface}" == "lo0" ]]; then
+    return 0
+  fi
+
+  case "${destination}" in
     ""|default)
       return 0
       ;;
@@ -98,6 +97,137 @@ pcs_host_dns_is_safe_ip() {
       return 1
       ;;
   esac
+}
+
+# Print the source address of one ping reply, or nothing if nobody answers.
+# macOS ping -W is a per-reply timeout in milliseconds.
+pcs_host_dns_ping_source() {
+  local ip="$1"
+  local src=""
+
+  src="$(
+    ping -n -c 1 -W 400 "${ip}" 2>/dev/null | awk '
+      /bytes from / {
+        line = $0
+        sub(/.*bytes from /, "", line)
+        sub(/:.*/, "", line)
+        gsub(/[[:space:]]/, "", line)
+        print line
+        exit
+      }
+    ' || true
+  )"
+  printf '%s\n' "${src}"
+}
+
+# Returns 0 if the candidate IP is free to use as a new --localhost target:
+# route_ok, and not answering ping. A live localhost redirect answers from
+# 127.0.0.1, so this rejects that address too — callers must not use this to
+# judge an existing mapping, or every start would rotate the IP.
+pcs_host_dns_is_safe_ip() {
+  local ip="$1"
+  local src
+
+  if ! pcs_host_dns_route_ok "${ip}"; then
+    return 1
+  fi
+  src="$(pcs_host_dns_ping_source "${ip}")"
+  if [[ -n "${src}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Returns 0 when TCP to ip reaches a listener bound only to 127.0.0.1.
+# Apple's --localhost option installs `rdr inet from any to <ip> -> 127.0.0.1`.
+# The DNS name survives a network change; the loaded pf rule often does not.
+# A ping reply is not used here: a working redirect and a real host both answer,
+# and the reply text does not reliably show 127.0.0.1.
+pcs_host_dns_redirect_active() {
+  local ip="$1"
+  local port pid ready _attempt _spin
+
+  if ! command -v nc >/dev/null 2>&1; then
+    if [[ "$(pcs_host_dns_ping_source "${ip}")" == "127.0.0.1" ]]; then
+      return 0
+    fi
+    return 1
+  fi
+
+  for _attempt in 1 2 3; do
+    port=$((40000 + (RANDOM % 20000)))
+    # -k keeps the listener up so the readiness connect does not consume it.
+    # macOS nc: `nc -l host port` (do not combine -l with -p, -s, or -z).
+    nc -k -l 127.0.0.1 "${port}" >/dev/null 2>&1 &
+    pid=$!
+    ready=false
+    for _spin in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        wait "${pid}" 2>/dev/null || true
+        pid=""
+        break
+      fi
+      if nc -z -G 1 127.0.0.1 "${port}" >/dev/null 2>&1; then
+        ready=true
+        break
+      fi
+      sleep 0.02
+    done
+
+    if [[ "${ready}" != true ]]; then
+      if [[ -n "${pid}" ]]; then
+        kill "${pid}" 2>/dev/null || true
+        wait "${pid}" 2>/dev/null || true
+      fi
+      continue
+    fi
+
+    if nc -z -G 1 "${ip}" "${port}" >/dev/null 2>&1; then
+      kill "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+      return 0
+    fi
+
+    kill "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    return 1
+  done
+
+  # Could not bind a local listener. Fall back to the ICMP signal.
+  if [[ "$(pcs_host_dns_ping_source "${ip}")" == "127.0.0.1" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Decide what to do with the current mapping. Arguments are plain facts so
+# the policy can be tested without Apple Container:
+#   $1 exists      true|false   domain is in `container system dns list`
+#   $2 ip          current --localhost address, or empty if it could not be read
+#   $3 route_ok    true|false   ip is still safe on this network
+#   $4 redirect_ok true|false   pf redirect to 127.0.0.1 answered
+# Prints one of: keep, create, repair-same, repair-new.
+pcs_host_dns_decide() {
+  local exists="${1:-false}"
+  local ip="${2:-}"
+  local route_ok="${3:-false}"
+  local redirect_ok="${4:-false}"
+
+  if [[ "${exists}" != true ]]; then
+    printf 'create\n'
+    return 0
+  fi
+  if [[ -n "${ip}" && "${route_ok}" == true && "${redirect_ok}" == true ]]; then
+    printf 'keep\n'
+    return 0
+  fi
+  # Same address, dead redirect: recreate it so pf is reloaded. Do not pick a
+  # new address just because the rule is gone.
+  if [[ -n "${ip}" && "${route_ok}" == true ]]; then
+    printf 'repair-same\n'
+    return 0
+  fi
+  printf 'repair-new\n'
 }
 
 # Find a synthetic IP that is safe to map to the host's 127.0.0.1.
@@ -134,94 +264,170 @@ pcs_host_dns_find_safe_ip() {
   return 1
 }
 
-# Idempotently ensure the host.container.internal -> safe localhost IP DNS mapping
-# exists in the Apple Container system.
-#
-# The current synthetic IP is retrieved from macOS DNS configuration using
-# scutil, avoiding direct access to /etc/pf.anchors.
-pcs_ensure_host_dns_mapping() {
-  local safe_ip current_ip
-  local mapping_exists=false
+# Returns 0 when Apple Container has a DNS domain for the host alias.
+pcs_host_dns_domain_exists() {
+  container system dns list 2>/dev/null |
+    awk 'NR > 1 { print $1 }' |
+    grep -Fxq "${PCS_HOST_DNS_NAME}"
+}
 
-  if ! safe_ip="$(pcs_host_dns_find_safe_ip)"; then
+# Print the localhost IP from an Apple Container resolver file on stdin.
+pcs_host_dns_ip_from_resolver_text() {
+  awk '
+    {
+      line = $0
+      if (!sub(/.*localhost:/, "", line)) next
+      sub(/[^0-9.].*/, "", line)
+      if (line ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+        print line
+        exit
+      }
+    }
+  '
+}
+
+# Print the localhost IP for one domain from a `scutil --dns` dump on stdin.
+# scutil lists `flags` before `options` inside a resolver block. Stopping at
+# `flags` always misses `options localhost:<ip>`, so the caller thinks the
+# mapping has no address, skips delete, and `dns create` fails because the
+# name already exists.
+pcs_host_dns_ip_from_scutil_text() {
+  local domain="${1:-${PCS_HOST_DNS_NAME}}"
+  awk -v domain="${domain}" '
+    $1 == "domain" && $3 == domain { found = 1; next }
+    found && $1 == "domain" { exit }
+    found && /localhost:/ {
+      line = $0
+      sub(/.*localhost:/, "", line)
+      sub(/[^0-9.].*/, "", line)
+      if (line ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print line
+      exit
+    }
+  '
+}
+
+# Print the --localhost IP configured for the host alias.
+# Returns 1 when it cannot be read. The domain may still exist.
+# Prefers /etc/resolver/containerization.<name> (`options localhost:<ip>`).
+pcs_host_dns_configured_ip() {
+  local file ip=""
+
+  file="/etc/resolver/containerization.${PCS_HOST_DNS_NAME}"
+  if [[ -r "${file}" ]]; then
+    ip="$(pcs_host_dns_ip_from_resolver_text < "${file}")"
+  fi
+
+  if [[ -z "${ip}" ]]; then
+    ip="$(scutil --dns 2>/dev/null | pcs_host_dns_ip_from_scutil_text "${PCS_HOST_DNS_NAME}" || true)"
+  fi
+
+  if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s\n' "${ip}"
+    return 0
+  fi
+  return 1
+}
+
+# Ensure host.container.internal is a working localhost redirect.
+# sudo runs only when the mapping must be created or replaced.
+pcs_ensure_host_dns_mapping() {
+  local exists=false
+  local ip="" route_ok=false redirect_ok=false
+  local decision target=""
+
+  if pcs_host_dns_domain_exists; then
+    exists=true
+    ip="$(pcs_host_dns_configured_ip || true)"
+  fi
+
+  if [[ "${exists}" == true && -n "${ip}" ]] && pcs_host_dns_route_ok "${ip}"; then
+    route_ok=true
+    if pcs_host_dns_redirect_active "${ip}"; then
+      redirect_ok=true
+    fi
+  fi
+
+  decision="$(pcs_host_dns_decide "${exists}" "${ip}" "${route_ok}" "${redirect_ok}")"
+
+  case "${decision}" in
+    keep)
+      pcs_info "host DNS mapping already correct:"
+      pcs_info "  ${PCS_HOST_DNS_NAME} -> ${ip} (localhost redirect active)"
+      return 0
+      ;;
+    create|repair-same|repair-new)
+      ;;
+    *)
+      pcs_err "internal error: unexpected host DNS plan '${decision}'"
+      return 1
+      ;;
+  esac
+
+  if [[ "${decision}" == "repair-same" ]]; then
+    target="${ip}"
+  elif ! target="$(pcs_host_dns_find_safe_ip)"; then
     pcs_err "no suitable localhost-mapping IP found for ${PCS_HOST_DNS_NAME}."
     pcs_err "Check active VPNs, routes and local interfaces."
     return 1
   fi
 
-  # default is empty
-  current_ip=""
+  case "${decision}" in
+    create)
+      pcs_info "host DNS mapping is missing; creating ${PCS_HOST_DNS_NAME} -> ${target}"
+      ;;
+    repair-same)
+      pcs_info "host DNS mapping is not redirecting to 127.0.0.1:"
+      pcs_info "  ${PCS_HOST_DNS_NAME} -> ${ip}"
+      pcs_info "Recreating the same mapping so the packet-filter rule is reloaded."
+      ;;
+    repair-new)
+      if [[ -n "${ip}" ]]; then
+        pcs_info "host DNS mapping is not valid on this network:"
+        pcs_info "  current:  ${PCS_HOST_DNS_NAME} -> ${ip}"
+        pcs_info "  required: ${PCS_HOST_DNS_NAME} -> ${target}"
+      else
+        pcs_info "host DNS mapping exists, but its localhost IP could not be read."
+        pcs_info "Replacing it with ${PCS_HOST_DNS_NAME} -> ${target}."
+      fi
+      ;;
+  esac
 
-  # Check whether Apple Container knows the container domain.
-  if container system dns list 2>/dev/null |
-      awk 'NR > 1 { print $1 }' |
-      grep -Fxq "${PCS_HOST_DNS_NAME}"; then
-    mapping_exists=true
-
-    # if it exists, extract the currently configured synthetic localhost IP from macOS DNS.
-    current_ip="$(
-      scutil --dns 2>/dev/null |
-        awk -v domain="${PCS_HOST_DNS_NAME}" '
-          $1 == "domain" && $3 == domain {
-            found = 1
-          }
-          found && $1 == "options" {
-            if (match($0, /localhost:[0-9.]+/)) {
-              value = substr($0, RSTART, RLENGTH)
-              sub(/^localhost:/, "", value)
-              print value
-              exit
-            }
-          }
-          found && $1 == "flags" {
-            exit
-          }
-        '
-    )"
-  fi
-
-  if [[ "${mapping_exists}" == true && "${current_ip}" == "${safe_ip}" ]]; then
-    pcs_info "host DNS mapping already correct:"
-    pcs_info "  ${PCS_HOST_DNS_NAME} -> ${current_ip}"
-    return 0
-  fi
-
-  # if it exists and current IP is not empty, then delete it
-  if [[ "${mapping_exists}" == true && "${current_ip}" != "" ]]; then
-    if [[ -n "${current_ip}" ]]; then
-      pcs_info "host DNS mapping is stale:"
-      pcs_info "  current:  ${PCS_HOST_DNS_NAME} -> ${current_ip}"
-      pcs_info "  required: ${PCS_HOST_DNS_NAME} -> ${safe_ip}"
-    else
-      pcs_info "host DNS mapping exists, but its current IP could not be determined."
-      pcs_info "Recreating it using ${safe_ip}."
-    fi
-
+  if [[ "${decision}" != "create" ]]; then
     pcs_info "sudo container system dns delete ${PCS_HOST_DNS_NAME}"
-
     if ! sudo container system dns delete "${PCS_HOST_DNS_NAME}"; then
       pcs_err "failed to delete the existing ${PCS_HOST_DNS_NAME} DNS mapping."
       return 1
     fi
   fi
 
-  pcs_info "Creating ${PCS_HOST_DNS_NAME} using synthetic IP ${safe_ip} using sudo"
-  pcs_info "sudo container system dns create ${PCS_HOST_DNS_NAME} --localhost ${safe_ip}"
-
-  if ! sudo container system dns create \
-    "${PCS_HOST_DNS_NAME}" \
-    --localhost "${safe_ip}"; then
+  pcs_info "sudo container system dns create ${PCS_HOST_DNS_NAME} --localhost ${target}"
+  if ! sudo container system dns create "${PCS_HOST_DNS_NAME}" --localhost "${target}"; then
     pcs_err "failed to create the ${PCS_HOST_DNS_NAME} DNS mapping."
     return 1
   fi
 
-  echo "Created mapping:"
-  container system dns list | grep -Fx "${PCS_HOST_DNS_NAME}" || true
+  pcs_info "host DNS mapping updated: ${PCS_HOST_DNS_NAME} -> ${target}"
+  return 0
+}
 
-  echo
-  echo "Container API URL:"
-  echo "http://${PCS_HOST_DNS_NAME}:8000/v1"
+# Returns 0 when the configured alias is present, still safe on this network,
+# and actually redirecting to 127.0.0.1. Used by pcs verify.
+pcs_host_dns_mapping_ok() {
+  local ip=""
 
+  if ! pcs_host_dns_domain_exists; then
+    return 1
+  fi
+  ip="$(pcs_host_dns_configured_ip || true)"
+  if [[ -z "${ip}" ]]; then
+    return 1
+  fi
+  if ! pcs_host_dns_route_ok "${ip}"; then
+    return 1
+  fi
+  if ! pcs_host_dns_redirect_active "${ip}"; then
+    return 1
+  fi
   return 0
 }
 
@@ -270,10 +476,10 @@ pcs_cmd_start() {
   if [[ -z "${OPENAI_BASE_URL:-}" ]]; then
     pcs_warn "OPENAI_BASE_URL is not set in ${PCS_ENV_FILE}; Pi will not be able to reach the Qwen/oMLX endpoint."
   elif [[ "${OPENAI_BASE_URL}" == *"${PCS_HOST_DNS_NAME}"* ]]; then
-    # The endpoint uses the synthetic host-container hostname, which only
-    # resolves if the system DNS entry exists. Self-repair it (idempotent;
-    # sudo only on first creation). Never fatal: if the mapping cannot be
-    # created the sandbox still starts, the endpoint just stays unreachable.
+    # The endpoint uses the synthetic host-container hostname. Repair the
+    # mapping only when it is missing or no longer a working localhost
+    # redirect. sudo is required only for that create or replace. Never
+    # fatal: the sandbox still starts, the endpoint just stays unreachable.
     pcs_ensure_host_dns_mapping \
       || pcs_warn "could not ensure the ${PCS_HOST_DNS_NAME} DNS mapping; the endpoint will not resolve inside the sandbox."
   fi

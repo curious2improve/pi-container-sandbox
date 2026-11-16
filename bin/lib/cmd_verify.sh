@@ -27,8 +27,9 @@ Checks performed:
   - (tool *presence* is checked; versions are intentionally unpinned)
   - public HTTPS reachability
   - configured Qwen /v1/models endpoint reachability
-  - host DNS mapping host.container.internal is present (only when the
-    configured endpoint uses it; ensured automatically by 'pcs start')
+  - host DNS mapping host.container.internal is a working localhost
+    redirect (only when the configured endpoint uses it; repaired by
+    'pcs start' when the IP is routed or the packet-filter rule is down)
 
 This requires a /workspace source: use --workspace-source, or a mapping
 already persisted in config/sandbox.env (see 'pcs start --help').
@@ -279,11 +280,15 @@ fi
   local HOST_FAIL=0
 
   # When the endpoint uses the synthetic host-container hostname, the
-  # system-wide Apple Container DNS entry must exist (it is ensured by
-  # 'pcs start', which requires sudo on first creation).
+  # mapping must still redirect to 127.0.0.1 on this network. 'pcs start'
+  # recreates it (sudo only then) after a network change or reboot drops
+  # the packet-filter rule, or when the synthetic IP becomes routed.
   if [[ "${OPENAI_BASE_URL:-}" == *host.container.internal* ]]; then
-    if container system dns list 2>/dev/null | grep -Fq "host.container.internal"; then
-      echo "[PASS] host DNS mapping present (host.container.internal)"
+    if pcs_host_dns_mapping_ok; then
+      echo "[PASS] host DNS mapping redirects to 127.0.0.1 (host.container.internal)"
+    elif pcs_host_dns_domain_exists; then
+      echo "[FAIL] host DNS mapping is stale (host.container.internal) — run: pcs start"
+      HOST_FAIL=1
     else
       echo "[FAIL] host DNS mapping missing (host.container.internal) — run: pcs start"
       HOST_FAIL=1
