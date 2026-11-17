@@ -7,7 +7,7 @@ Usage: pcs status [-h|--help]
 
 Print a status summary: Apple Container service state, image presence,
 container state, workspace source mapping, configured resource limits, and
-the configured Qwen/oMLX endpoint (credentials redacted).
+OPENAI_BASE_URL (credentials redacted).
 EOF
 }
 
@@ -77,9 +77,9 @@ pcs_cmd_status() {
   echo "Memory: ${PI_SANDBOX_MEMORY}"
 
   echo
-  echo "== Qwen/oMLX endpoint =="
-  if [[ -n "${PI_SANDBOX_QWEN_URL:-}" ]]; then
-    echo "endpoint: ${PI_SANDBOX_QWEN_URL}"
+  echo "== OPENAI_BASE_URL =="
+  if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
+    echo "endpoint: ${OPENAI_BASE_URL}"
   else
     echo "endpoint: (not set; optional — models come from home-agent/.pi/agent/models.json)"
   fi

@@ -45,8 +45,8 @@ Run 'pcs <subcommand> --help' for subcommand options.
 EOF
 }
 
-# Map a subcommand name (e.g. "import-project") to its function name
-# (pcs_cmd_import_project). Prints the name on success; fails if no such
+# Map a subcommand name (e.g. "start") to its function name (pcs_cmd_start).
+# Hyphens become underscores. Prints the name on success; fails if no such
 # subcommand is implemented.
 pcs_fn_name() {
   local sub="$1"

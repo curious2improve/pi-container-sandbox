@@ -41,7 +41,6 @@ pcs_load_defaults() {
   PI_SANDBOX_MEMORY="${PI_SANDBOX_MEMORY:-16G}"
   PI_SANDBOX_IMAGE="${PI_SANDBOX_IMAGE:-local/pi-dev:trixie}"
   PI_SANDBOX_NAME="${PI_SANDBOX_NAME:-pi-sandbox}"
-  PI_SANDBOX_QWEN_URL="${PI_SANDBOX_QWEN_URL:-${OPENAI_BASE_URL:-}}"
   # Space- or comma-separated list of pi extensions (package sources) that
   # must be present inside the sandbox; 'pcs start' installs any that are
   # missing. See pcs_ensure_pi_extensions().
@@ -49,7 +48,7 @@ pcs_load_defaults() {
   # Host folder bind-mounted read-write at /workspace. Supplied via
   # 'pcs start|shell --workspace-source' on first use, then persisted here.
   PI_SANDBOX_WORKSPACE_SOURCE="${PI_SANDBOX_WORKSPACE_SOURCE:-}"
-  export PI_SANDBOX_CPUS PI_SANDBOX_MEMORY PI_SANDBOX_IMAGE PI_SANDBOX_NAME PI_SANDBOX_QWEN_URL PI_SANDBOX_EXTENSIONS PI_SANDBOX_WORKSPACE_SOURCE
+  export PI_SANDBOX_CPUS PI_SANDBOX_MEMORY PI_SANDBOX_IMAGE PI_SANDBOX_NAME PI_SANDBOX_EXTENSIONS PI_SANDBOX_WORKSPACE_SOURCE
 }
 
 # Load config/sandbox.env (if present) without clobbering variables already
@@ -165,26 +164,6 @@ pcs_config_needs_host_dns() {
   done < <(pcs_models_json_base_urls)
 
   return 1
-}
-
-# Rewrite the URL so a loopback host becomes the synthetic container-domain
-# hostname (port and path preserved). Any other host is printed unchanged.
-pcs_map_url_to_container_domain() {
-  local url="${1:-}"
-  local scheme rest host
-
-  if [[ "${url}" =~ ^(https?://) ]]; then
-    scheme="${BASH_REMATCH[1]}"
-    rest="${url#"${scheme}"}"
-    host="${rest%%[/:]*}"
-    case "${host}" in
-      localhost|127.0.0.1|::1)
-        printf '%s%s%s' "${scheme}" "${PCS_HOST_DNS_NAME}" "${rest:$((${#host}))}"
-        return 0
-        ;;
-    esac
-  fi
-  printf '%s' "${url}"
 }
 
 # Host directory bind-mounted (read-write) at /workspace. Supplied via
@@ -372,9 +351,8 @@ pcs_container_running() {
 
 # ---------------------------------------------------------------------------
 # Shared standard mount/security flags for run/create/exec-style invocations.
-# Populates the PCS_RUN_FLAGS array; callers must declare it with
-# `local -a PCS_RUN_FLAGS=()` (or similar) before calling, or use it as a
-# global array as done in the commands below.
+# pcs_build_security_flags fills PCS_SECURITY_FLAGS; pcs_build_volume_flags
+# fills PCS_VOLUME_FLAGS. Both are global arrays used by the commands below.
 # ---------------------------------------------------------------------------
 pcs_build_security_flags() {
   PCS_SECURITY_FLAGS=(

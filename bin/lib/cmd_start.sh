@@ -63,11 +63,13 @@ home-agent/.pi/agent/models.json. On every start, OPENAI_BASE_URL and the
 baseUrl entries of models.json are checked independently. If any of them
 points at the host loopback (localhost / 127.0.0.1 / ::1) or already at the
 synthetic hostname host.container.internal, the Apple Container DNS entry
-for host.container.internal is checked: it is created or replaced only when
-it is missing, its IP is no longer safe on the current network, or the
-packet-filter redirect to 127.0.0.1 is not active (that rule is dropped on
-reboot and can go stale after a network change). sudo is used only for that
-create or replace. The container's entrypoint additionally rewrites such
+for host.container.internal is checked: it is created or replaced only
+with positive evidence that it is broken — it is missing, its IP is no
+longer safe on the current network, or the probe proves the packet-filter
+redirect to 127.0.0.1 is gone (that rule is dropped on reboot and can go
+stale after a network change). If the redirect cannot be verified either
+way, the mapping is left untouched. sudo is used only for that create or
+replace. The container's entrypoint additionally rewrites such
 loopback URLs to host.container.internal (the environment variable for the
 session, the models.json lines in place). URLs pointing at any other host,
 domain, or IP (external APIs, the VM gateway) are left untouched. The
@@ -145,23 +147,22 @@ pcs_host_dns_is_safe_ip() {
   return 0
 }
 
-# Returns 0 when TCP to ip reaches a listener bound only to 127.0.0.1.
+# Print the state of the pf redirect for one mapping IP: active, dead, or
+# unknown.
 # Apple's --localhost option installs `rdr inet from any to <ip> -> 127.0.0.1`.
 # The DNS name survives a network change; the loaded pf rule often does not.
-# A ping reply is not used here: a working redirect and a real host both answer,
-# and the reply text does not reliably show 127.0.0.1.
-pcs_host_dns_redirect_active() {
+# "dead" is only reported on positive evidence: a local listener that was
+# definitely up, reached twice in a row via the IP, never, or a ping reply
+# from something other than 127.0.0.1 (the address is now in use). Probe
+# failures (no nc, no bindable port, unanswered ping) print "unknown", so a
+# healthy mapping is never deleted because of a flaky check.
+pcs_host_dns_redirect_state() {
   local ip="$1"
-  local port pid ready _attempt _spin
+  local port pid ready src dead_hits=0
+  local _attempt _spin
 
-  if ! command -v nc >/dev/null 2>&1; then
-    if [[ "$(pcs_host_dns_ping_source "${ip}")" == "127.0.0.1" ]]; then
-      return 0
-    fi
-    return 1
-  fi
-
-  for _attempt in 1 2 3; do
+  if command -v nc >/dev/null 2>&1; then
+    for _attempt in 1 2 3 4 5; do
     port=$((40000 + (RANDOM % 20000)))
     # -k keeps the listener up so the readiness connect does not consume it.
     # macOS nc: `nc -l host port` (do not combine -l with -p, -s, or -z).
@@ -192,19 +193,32 @@ pcs_host_dns_redirect_active() {
     if nc -z -G 1 "${ip}" "${port}" >/dev/null 2>&1; then
       kill "${pid}" 2>/dev/null || true
       wait "${pid}" 2>/dev/null || true
+      printf 'active\n'
       return 0
     fi
 
     kill "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
-    return 1
+    # The listener was definitely up and the IP never reached it. One miss
+    # can be transient; two consistent misses prove the rdr rule is gone.
+    dead_hits=$((dead_hits + 1))
+    if (( dead_hits >= 2 )); then
+      printf 'dead\n'
+      return 0
+    fi
   done
-
-  # Could not bind a local listener. Fall back to the ICMP signal.
-  if [[ "$(pcs_host_dns_ping_source "${ip}")" == "127.0.0.1" ]]; then
-    return 0
   fi
-  return 1
+
+  # ICMP tie-break: a live redirect answers from 127.0.0.1 and a reply from
+  # any other address proves the IP is in use. Silence is not evidence —
+  # unrouted TEST-NET traffic often simply gets no answer at all.
+  src="$(pcs_host_dns_ping_source "${ip}")"
+  case "${src}" in
+    127.0.0.1) printf 'active\n' ;;
+    "") printf 'unknown\n' ;;
+    *) printf 'dead\n' ;;
+  esac
+  return 0
 }
 
 # Decide what to do with the current mapping. Arguments are plain facts so
@@ -212,19 +226,21 @@ pcs_host_dns_redirect_active() {
 #   $1 exists      true|false   domain is in `container system dns list`
 #   $2 ip          current --localhost address, or empty if it could not be read
 #   $3 route_ok    true|false   ip is still safe on this network
-#   $4 redirect_ok true|false   pf redirect to 127.0.0.1 answered
+#   $4 redirect    active|dead|unknown   pf redirect state (see above)
 # Prints one of: keep, create, repair-same, repair-new.
+# "unknown" never repairs: without positive evidence the mapping stays
+# untouched, so a flaky probe can never delete a working one.
 pcs_host_dns_decide() {
   local exists="${1:-false}"
   local ip="${2:-}"
   local route_ok="${3:-false}"
-  local redirect_ok="${4:-false}"
+  local redirect="${4:-unknown}"
 
   if [[ "${exists}" != true ]]; then
     printf 'create\n'
     return 0
   fi
-  if [[ -n "${ip}" && "${route_ok}" == true && "${redirect_ok}" == true ]]; then
+  if [[ -n "${ip}" && "${route_ok}" == true && "${redirect}" != dead ]]; then
     printf 'keep\n'
     return 0
   fi
@@ -339,7 +355,7 @@ pcs_host_dns_configured_ip() {
 # sudo runs only when the mapping must be created or replaced.
 pcs_ensure_host_dns_mapping() {
   local exists=false
-  local ip="" route_ok=false redirect_ok=false
+  local ip="" route_ok=false redirect=unknown
   local decision target=""
 
   if pcs_host_dns_domain_exists; then
@@ -349,17 +365,20 @@ pcs_ensure_host_dns_mapping() {
 
   if [[ "${exists}" == true && -n "${ip}" ]] && pcs_host_dns_route_ok "${ip}"; then
     route_ok=true
-    if pcs_host_dns_redirect_active "${ip}"; then
-      redirect_ok=true
-    fi
+    redirect="$(pcs_host_dns_redirect_state "${ip}")"
   fi
 
-  decision="$(pcs_host_dns_decide "${exists}" "${ip}" "${route_ok}" "${redirect_ok}")"
+  decision="$(pcs_host_dns_decide "${exists}" "${ip}" "${route_ok}" "${redirect}")"
 
   case "${decision}" in
     keep)
-      pcs_info "host DNS mapping already correct:"
-      pcs_info "  ${PCS_HOST_DNS_NAME} -> ${ip} (localhost redirect active)"
+      if [[ "${redirect}" == unknown ]]; then
+        pcs_info "host DNS mapping left as is: ${PCS_HOST_DNS_NAME} -> ${ip}"
+        pcs_info "  (localhost redirect could not be verified; nothing was changed)"
+      else
+        pcs_info "host DNS mapping already correct:"
+        pcs_info "  ${PCS_HOST_DNS_NAME} -> ${ip} (localhost redirect active)"
+      fi
       return 0
       ;;
     create|repair-same|repair-new)
@@ -383,7 +402,7 @@ pcs_ensure_host_dns_mapping() {
       pcs_info "host DNS mapping is missing; creating ${PCS_HOST_DNS_NAME} -> ${target}"
       ;;
     repair-same)
-      pcs_info "host DNS mapping is not redirecting to 127.0.0.1:"
+      pcs_info "host DNS mapping does not redirect to 127.0.0.1 (verified):"
       pcs_info "  ${PCS_HOST_DNS_NAME} -> ${ip}"
       pcs_info "Recreating the same mapping so the packet-filter rule is reloaded."
       ;;
@@ -400,6 +419,14 @@ pcs_ensure_host_dns_mapping() {
   esac
 
   if [[ "${decision}" != "create" ]]; then
+    # Drift guard: never delete a mapping whose current content we cannot
+    # re-read as exactly what we inspected. (The CLI has no in-place update.
+    #) If the state changed since the probe, abort instead of destroying it.
+    if ! pcs_host_dns_domain_exists ||
+       [[ "$(pcs_host_dns_configured_ip || true)" != "${ip}" ]]; then
+      pcs_err "the ${PCS_HOST_DNS_NAME} mapping changed while deciding; not deleting it."
+      return 1
+    fi
     pcs_info "sudo container system dns delete ${PCS_HOST_DNS_NAME}"
     if ! sudo container system dns delete "${PCS_HOST_DNS_NAME}"; then
       pcs_err "failed to delete the existing ${PCS_HOST_DNS_NAME} DNS mapping."
@@ -417,23 +444,30 @@ pcs_ensure_host_dns_mapping() {
   return 0
 }
 
-# Returns 0 when the configured alias is present, still safe on this network,
-# and actually redirecting to 127.0.0.1. Used by pcs verify.
-pcs_host_dns_mapping_ok() {
-  local ip=""
+# Print the health of the configured alias: ok, dead, unknown, or missing.
+# "unknown" means the redirect could not be probed; it is not evidence of a
+# broken mapping.
+pcs_host_dns_mapping_state() {
+  local ip="" state
 
   if ! pcs_host_dns_domain_exists; then
-    return 1
+    printf 'missing\n'
+    return 0
   fi
   ip="$(pcs_host_dns_configured_ip || true)"
   if [[ -z "${ip}" ]]; then
-    return 1
+    printf 'dead\n'
+    return 0
   fi
   if ! pcs_host_dns_route_ok "${ip}"; then
-    return 1
+    printf 'dead\n'
+    return 0
   fi
-  if ! pcs_host_dns_redirect_active "${ip}"; then
-    return 1
+  state="$(pcs_host_dns_redirect_state "${ip}")"
+  if [[ "${state}" == active ]]; then
+    printf 'ok\n'
+  else
+    printf '%s\n' "${state}"
   fi
   return 0
 }

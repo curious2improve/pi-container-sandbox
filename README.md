@@ -100,7 +100,7 @@ Every subcommand:
 | Subcommand | Purpose |
 |---|---|
 | `pcs build` | Build and tag `local/pi-dev:trixie` for `linux/arm64`, always resolving dependencies to their newest releases. |
-| `pcs start [--workspace-source <dir>]` | Start interactively (default: `pi` in `/workspace`). `--workspace-source` is mandatory on first use (an existing local folder), then persisted in `config/sandbox.env`; passing it again updates the mapping. `OPENAI_BASE_URL` is optional. If `OPENAI_BASE_URL` or any models.json `baseUrl` points at the host loopback (`localhost` / `127.0.0.1`) or `host.container.internal`, checks that the DNS mapping still redirects to the host and updates it only when it does not (`sudo` only for that create or replace); the container entrypoint rewrites such loopback URLs to `host.container.internal`. Other hosts/IPs are left untouched. |
+| `pcs start [--workspace-source <dir>]` | Start interactively (default: `pi` in `/workspace`). `--workspace-source` is mandatory on first use (an existing local folder), then persisted in `config/sandbox.env`; passing it again updates the mapping. `OPENAI_BASE_URL` is optional. If `OPENAI_BASE_URL` or any models.json `baseUrl` points at the host loopback (`localhost` / `127.0.0.1`) or `host.container.internal`, checks that the DNS mapping still redirects to the host and updates it only when there is positive evidence it does not — an unverifiable mapping is left untouched (`sudo` only for that create or replace); the container entrypoint rewrites such loopback URLs to `host.container.internal`. Other hosts/IPs are left untouched. |
 | `pcs shell [--workspace-source <dir>]` | Bash in `/workspace` of the running sandbox, or a temporary one. Same `--workspace-source` semantics as `start`. |
 | `pcs status` | Service / image / container / workspace-source / limits / endpoint. |
 | `pcs logs` | Print or follow sandbox container logs. |
@@ -152,8 +152,8 @@ Every subcommand:
 **Recommended: host-container DNS** (no engine changes). Write `http://host.container.internal:8000/v1` directly — or just use `http://127.0.0.1:8000/v1` / `http://localhost:8000/v1` and let the mapping do the work. `./bin/pcs start` then:
 
 1. Reads the current `host.container.internal` address (resolver file, then `scutil --dns`) and checks `container system dns list`.
-2. Leaves the mapping alone when that address is still safe on this network and a connection to it reaches `127.0.0.1` (no `sudo`).
-3. Otherwise creates it, or deletes and recreates it, with `sudo`. A dead packet-filter rule (common after reboot or a network change) keeps the same synthetic IP and only reloads the redirect. A routed or unreadable address is replaced with a new documentation-range IP.
+2. Leaves the mapping alone unless there is **positive evidence** it is broken: the address is routed/unsafe on this network, or a local listener that a connection via the address never reached (twice in a row) / a ping reply from a non-loopback source proves the `127.0.0.1` redirect is gone. A probe that simply cannot verify the redirect (no answer, no bindable port) leaves the mapping untouched — no `sudo`, no delete.
+3. Otherwise creates it, or deletes and recreates it, with `sudo` (the CLI has no in-place update). A dead packet-filter rule (common after reboot or a network change) keeps the same synthetic IP and only reloads the redirect. A routed or unreadable address is replaced with a new documentation-range IP. Right before deleting, the mapping is re-read and the delete is aborted if it no longer matches what was inspected.
 4. Note: some LLM engines or local proxies may require explicit whitelisting of allowed hosts, e.g. `splash --allowed-host host.container.internal --allowed-host localhost --allowed-host 127.0.0.1` 
 
 Any container can then reach an engine bound to **`127.0.0.1` only** — no `0.0.0.0` binding, no gateway-IP guessing, no port publishing.
@@ -203,7 +203,6 @@ PI_SANDBOX_CPUS=8
 PI_SANDBOX_MEMORY=16G
 PI_SANDBOX_IMAGE=local/pi-dev:trixie
 PI_SANDBOX_NAME=pi-sandbox
-PI_SANDBOX_QWEN_URL=http://host.container.internal:8000/v1
 ```
 
 ## Persistent storage

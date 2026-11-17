@@ -73,8 +73,8 @@ pcs_cmd_verify() {
   pcs_ensure_workspace_source "${WORKSPACE_SOURCE}" || exit 1
   pcs_ensure_agent_home
 
-  if [[ -n "${PI_SANDBOX_QWEN_URL:-}" ]]; then
-    pcs_info "configured Qwen/oMLX endpoint: ${PI_SANDBOX_QWEN_URL}"
+  if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
+    pcs_info "configured endpoint: ${OPENAI_BASE_URL}"
   else
     pcs_info "OPENAI_BASE_URL is not set (optional; models come from home-agent/.pi/agent/models.json)"
   fi
@@ -302,17 +302,28 @@ fi
   # points at the host loopback or already at the synthetic hostname, the
   # mapping must still redirect to 127.0.0.1 on this network. 'pcs start'
   # recreates it (sudo only then) after a network change or reboot drops
-  # the packet-filter rule, or when the synthetic IP becomes routed.
+  # the packet-filter rule, or when the synthetic IP becomes routed — but
+  # only with positive evidence the redirect is dead; an unverifiable but
+  # present mapping is a warning, not a failure.
   if pcs_config_needs_host_dns; then
-    if pcs_host_dns_mapping_ok; then
-      echo "[PASS] host DNS mapping redirects to 127.0.0.1 (host.container.internal)"
-    elif pcs_host_dns_domain_exists; then
-      echo "[FAIL] host DNS mapping is stale (host.container.internal) — run: pcs start"
-      HOST_FAIL=1
-    else
-      echo "[FAIL] host DNS mapping missing (host.container.internal) — run: pcs start"
-      HOST_FAIL=1
-    fi
+    local dns_state
+    dns_state="$(pcs_host_dns_mapping_state)"
+    case "${dns_state}" in
+      ok)
+        echo "[PASS] host DNS mapping redirects to 127.0.0.1 (host.container.internal)"
+        ;;
+      unknown)
+        echo "[WARN] host DNS mapping present but its localhost redirect could not be verified (host.container.internal)"
+        ;;
+      missing)
+        echo "[FAIL] host DNS mapping missing (host.container.internal) — run: pcs start"
+        HOST_FAIL=1
+        ;;
+      *)
+        echo "[FAIL] host DNS mapping is stale (host.container.internal) — run: pcs start"
+        HOST_FAIL=1
+        ;;
+    esac
   fi
 
   echo

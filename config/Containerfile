@@ -124,10 +124,6 @@ RUN groupadd --gid "${AGENT_GID}" "${AGENT_USER}" \
 # unprivileged user can manage its own global packages.
 RUN npm config set prefix "${AGENT_HOME}/.npm-global"
 
-# Install Playwright system-level shared libraries as root
-# The '--yes' flag forces non-interactive installation of system dependencies
-#RUN npx playwright install-deps --yes
-
 # ---------------------------------------------------------------------------
 # Pi coding agent: package name is a build arg, version is intentionally not
 # pinned — always the newest release from the npm registry at build time.
