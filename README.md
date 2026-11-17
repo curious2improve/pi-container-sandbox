@@ -37,7 +37,7 @@ A minimal, reproducible development sandbox for [Pi](https://github.com/earendil
 - **No version pinning.** Each build resolves the newest Debian packages, Pi agent, and npm/PyPI packages available at build time.
 - **Unprivileged `agent` (UID/GID 1000), never root.** All Linux capabilities dropped (`--cap-drop ALL`). Root filesystem is read-only; only `/tmp`, `/run`, and the two host bind mounts below are writable.
 - **Exactly two host bind mounts.** Your project folder (via `pcs start --workspace-source <dir>`, mandatory on first use, then persisted) at `/workspace` — edited in place, including `.git`. This repository’s `home-agent/` at `/home/agent` — the complete agent home (Pi state, package caches, dotfiles, tool config). A container entrypoint seeds it from an image-baked template exactly once and never overwrites your customizations. No other host path is ever mounted.
-- **Local or remote LLMs.** Talks to a Qwen / oMLX / “splash” OpenAI-compatible API on the Mac, default `http://host.container.internal:8000/v1` (Apple Container maps that hostname to the host’s `127.0.0.1`). Or use any internet API (OpenRouter, etc.).
+- **Local or remote LLMs.** Talks to a Qwen / oMLX / “splash” OpenAI-compatible API on the Mac (default `http://host.container.internal:8000/v1`, mapped to the host’s `127.0.0.1`), or any internet API (OpenRouter, etc.). `OPENAI_BASE_URL` is **optional** — models can be defined entirely in `home-agent/.pi/agent/models.json`. Loopback URLs (`localhost` / `127.0.0.1`) in either `OPENAI_BASE_URL` or a models.json `baseUrl` are checked independently and mapped to `host.container.internal` on start; URLs pointing at any other host, domain, or IP are left completely untouched.
 - **Normal Apple Container networking.** Outbound Internet works. This is explicitly *not* a network-filtering solution.
 
 **Your responsibility:** because the project folder is fully visible to Pi, keep credentials and tokens Pi should not read out of it. `/home/agent` is the one place you may *deliberately* hand the agent git/SSH credentials and tool configs.
@@ -71,8 +71,10 @@ container image list
 ```bash
 ./bin/pcs build
 cp config/sandbox.env.example config/sandbox.env
-# edit config/sandbox.env if your endpoint is not
-# http://host.container.internal:8000/v1
+# OPENAI_BASE_URL in config/sandbox.env is optional — leave it unset
+# (commented out) when your models are defined in
+# home-agent/.pi/agent/models.json; a loopback host there is mapped to
+# host.container.internal automatically on start
 ./bin/pcs start --workspace-source ~/Projects/myproject   # first run: pick the project folder
 ./bin/pcs verify
 ./bin/pcs stop
@@ -98,7 +100,7 @@ Every subcommand:
 | Subcommand | Purpose |
 |---|---|
 | `pcs build` | Build and tag `local/pi-dev:trixie` for `linux/arm64`, always resolving dependencies to their newest releases. |
-| `pcs start [--workspace-source <dir>]` | Start interactively (default: `pi` in `/workspace`). `--workspace-source` is mandatory on first use (an existing local folder), then persisted in `config/sandbox.env`; passing it again updates the mapping. If the configured endpoint uses `host.container.internal`, checks that the DNS mapping still redirects to the host and updates it only when it does not (`sudo` only for that create or replace). |
+| `pcs start [--workspace-source <dir>]` | Start interactively (default: `pi` in `/workspace`). `--workspace-source` is mandatory on first use (an existing local folder), then persisted in `config/sandbox.env`; passing it again updates the mapping. `OPENAI_BASE_URL` is optional. If `OPENAI_BASE_URL` or any models.json `baseUrl` points at the host loopback (`localhost` / `127.0.0.1`) or `host.container.internal`, checks that the DNS mapping still redirects to the host and updates it only when it does not (`sudo` only for that create or replace); the container entrypoint rewrites such loopback URLs to `host.container.internal`. Other hosts/IPs are left untouched. |
 | `pcs shell [--workspace-source <dir>]` | Bash in `/workspace` of the running sandbox, or a temporary one. Same `--workspace-source` semantics as `start`. |
 | `pcs status` | Service / image / container / workspace-source / limits / endpoint. |
 | `pcs logs` | Print or follow sandbox container logs. |
@@ -138,11 +140,16 @@ Every subcommand:
 
 ### Local LLM endpoint (Qwen / oMLX / Ollama)
 
-Pi and `pcs verify` read the endpoint from `config/sandbox.env`.
+`OPENAI_BASE_URL` in `config/sandbox.env` is **optional**. The models Pi uses are defined in `home-agent/.pi/agent/models.json` (one provider entry per engine, each with a `baseUrl`) — you may leave `OPENAI_BASE_URL` unset (commented out) and use `models.json` alone.
 
-`127.0.0.1` **inside the container is not your Mac**, so `http://127.0.0.1:8000/v1` would fail.
+`127.0.0.1` **inside the container is not your Mac**, so an endpoint like `http://127.0.0.1:8000/v1` cannot work as written from inside the sandbox.
 
-**Recommended: host-container DNS** (no engine changes). Point `OPENAI_BASE_URL` at `http://host.container.internal:8000/v1`. `./bin/pcs start` then:
+**Loopback endpoints are mapped automatically.** `OPENAI_BASE_URL` and the `baseUrl` entries of `models.json` are checked **independently** — each on its own, on every start:
+
+- When one of them points at the host loopback (`localhost`, `127.0.0.1`, `::1`), the container entrypoint rewrites that host to the synthetic name `host.container.internal` (the environment variable for the session; the `baseUrl` lines in `models.json` in place), and `pcs start` / `pcs shell` make sure the Apple Container DNS entry for `host.container.internal` still redirects to the host’s own `127.0.0.1`.
+- URLs pointing at **any other host, domain, or IP** (external APIs like OpenRouter, the VM gateway, …) are left completely untouched.
+
+**Recommended: host-container DNS** (no engine changes). Write `http://host.container.internal:8000/v1` directly — or just use `http://127.0.0.1:8000/v1` / `http://localhost:8000/v1` and let the mapping do the work. `./bin/pcs start` then:
 
 1. Reads the current `host.container.internal` address (resolver file, then `scutil --dns`) and checks `container system dns list`.
 2. Leaves the mapping alone when that address is still safe on this network and a connection to it reaches `127.0.0.1` (no `sudo`).
@@ -165,7 +172,7 @@ OPENAI_API_KEY=local-only-placeholder
    OPENAI_BASE_URL=http://192.168.64.1:8000/v1
    ```
 
-This project never modifies your local engine’s configuration. It only consumes `OPENAI_BASE_URL` / `OPENAI_API_KEY`. `./bin/pcs verify` prints the configured endpoint (never the API key) and fails concisely if `/v1/models` is unreachable.
+This project never modifies your local engine’s configuration. It only consumes `OPENAI_BASE_URL` / `OPENAI_API_KEY` and the `baseUrl` entries of `models.json`. `./bin/pcs verify` prints the configured endpoint (never the API key), checks that models.json loopback `baseUrl` entries have been mapped, and fails concisely when `OPENAI_BASE_URL` is set and its `/v1/models` is unreachable.
 
 ### Pi settings and extensions
 
@@ -212,7 +219,7 @@ The `/workspace` source is `pcs start --workspace-source <dir>` (mandatory on fi
 
 `home-agent/` contents are git-ignored (live state: sessions, credentials). Whatever you place there is visible at `/home/agent`; whatever the agent writes appears on the host. `pcs start` warns if the directory’s host UID is not 1000, which would block writes from inside.
 
-**First-use seeding.** The image bakes a template at `/usr/local/share/home-agent-template` (a path the mount does not hide). `config/sandbox-entrypoint.sh` copies it with `cp -an` exactly once (existing files are never overwritten) and records that in `home-agent/.sandbox-home-initialized`. Delete the marker or the folder to force a re-seed.
+**First-use seeding.** The image bakes a template at `/usr/local/share/home-agent-template` (a path the mount does not hide). `config/sandbox-entrypoint.sh` copies it with `cp -an` exactly once (existing files are never overwritten) and records that in `home-agent/.sandbox-home-initialized`. Delete the marker or the folder to force a re-seed. It also maps local LLM endpoints on every start: loopback hosts in `OPENAI_BASE_URL` and `models.json` `baseUrl` entries are rewritten to `host.container.internal` (see [Local LLM endpoint](#local-llm-endpoint-qwen--omlx--ollama)).
 
 npm / pip / uv caches live in the agent home (`.npm/`, `.cache/`, `.local/`) and persist between sessions. No `/tmp` redirection is performed.
 

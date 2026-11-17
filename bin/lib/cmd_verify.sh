@@ -26,10 +26,14 @@ Checks performed:
     patch, man-db, lsof, htop, yq, uv, gh, strace, tmux, fzf are installed
   - (tool *presence* is checked; versions are intentionally unpinned)
   - public HTTPS reachability
-  - configured Qwen /v1/models endpoint reachability
+  - OPENAI_BASE_URL (optional) — when set, its /v1/models endpoint
+    reachability
+  - models.json baseUrl entries do not point at the loopback (the
+    entrypoint rewrites localhost/127.0.0.1 to host.container.internal)
   - host DNS mapping host.container.internal is a working localhost
-    redirect (only when the configured endpoint uses it; repaired by
-    'pcs start' when the IP is routed or the packet-filter rule is down)
+    redirect (only when OPENAI_BASE_URL or a models.json baseUrl uses
+    localhost/127.0.0.1/host.container.internal; repaired by 'pcs start'
+    when the IP is routed or the packet-filter rule is down)
 
 This requires a /workspace source: use --workspace-source, or a mapping
 already persisted in config/sandbox.env (see 'pcs start --help').
@@ -69,7 +73,11 @@ pcs_cmd_verify() {
   pcs_ensure_workspace_source "${WORKSPACE_SOURCE}" || exit 1
   pcs_ensure_agent_home
 
-  pcs_info "configured Qwen/oMLX endpoint: ${PI_SANDBOX_QWEN_URL:-(not configured)}"
+  if [[ -n "${PI_SANDBOX_QWEN_URL:-}" ]]; then
+    pcs_info "configured Qwen/oMLX endpoint: ${PI_SANDBOX_QWEN_URL}"
+  else
+    pcs_info "OPENAI_BASE_URL is not set (optional; models come from home-agent/.pi/agent/models.json)"
+  fi
   pcs_info "(credentials are never printed by this command)"
 
   pcs_build_security_flags
@@ -237,7 +245,7 @@ else
   check "public HTTPS reachability (https://1.1.1.1)" "curl failed"
 fi
 
-# Qwen/oMLX endpoint
+# Qwen/oMLX endpoint (optional: models may come entirely from models.json)
 if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
   models_url="${OPENAI_BASE_URL%/}/models"
   if curl --silent --show-error --max-time 5 --output /dev/null \
@@ -251,7 +259,18 @@ if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
     check "Qwen/oMLX endpoint reachable (${models_url})" "curl failed: endpoint unreachable or not serving /v1/models${hint}"
   fi
 else
-  check "Qwen/oMLX endpoint configured" "OPENAI_BASE_URL is not set"
+  printf "[INFO] OPENAI_BASE_URL is not set (optional; models come from models.json)\n"
+fi
+
+# the entrypoint rewrites loopback baseUrl entries in models.json to
+# host.container.internal; any that remain means the mapping step did not run
+models_json="/home/agent/.pi/agent/models.json"
+if [[ -f "${models_json}" ]]; then
+  if grep -Eq '\''"baseUrl"[[:space:]]*:[[:space:]]*"https?://(localhost|127\.0\.0\.1|::1)([:/]|")'\'' "${models_json}"; then
+    check "models.json baseUrl entries do not point at the loopback" "localhost/127.0.0.1 baseUrl still present"
+  else
+    check "models.json baseUrl entries do not point at the loopback" ok
+  fi
 fi
 
 echo
@@ -279,11 +298,12 @@ fi
   echo
   local HOST_FAIL=0
 
-  # When the endpoint uses the synthetic host-container hostname, the
+  # When OPENAI_BASE_URL (checked independently) or a models.json baseUrl
+  # points at the host loopback or already at the synthetic hostname, the
   # mapping must still redirect to 127.0.0.1 on this network. 'pcs start'
   # recreates it (sudo only then) after a network change or reboot drops
   # the packet-filter rule, or when the synthetic IP becomes routed.
-  if [[ "${OPENAI_BASE_URL:-}" == *host.container.internal* ]]; then
+  if pcs_config_needs_host_dns; then
     if pcs_host_dns_mapping_ok; then
       echo "[PASS] host DNS mapping redirects to 127.0.0.1 (host.container.internal)"
     elif pcs_host_dns_domain_exists; then

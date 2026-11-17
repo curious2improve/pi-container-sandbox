@@ -73,6 +73,15 @@ pcs_cmd_shell() {
   pcs_build_security_flags
   pcs_build_volume_flags
 
+  # Same guarantee as 'pcs start': if OPENAI_BASE_URL or a models.json
+  # baseUrl points at the host loopback or at host.container.internal, the
+  # DNS mapping must exist before the container starts.
+  if pcs_config_needs_host_dns; then
+    pcs_info "local LLM endpoint detected; ensuring the ${PCS_HOST_DNS_NAME} -> 127.0.0.1 host DNS mapping..."
+    pcs_ensure_host_dns_mapping \
+      || pcs_warn "could not ensure the ${PCS_HOST_DNS_NAME} DNS mapping; the local endpoint will not resolve inside the sandbox."
+  fi
+
   exec container run \
     --rm "${TTY_FLAGS[@]}" \
     --name "${PI_SANDBOX_NAME}-shell" \

@@ -6,7 +6,7 @@
 # PID 1). It runs as the unprivileged 'agent' user (UID 1000), the same user
 # every 'pcs' container run uses.
 #
-# Two jobs, in order:
+# Three jobs, in order:
 #
 # 1. Seed the agent home ONCE. The host folder mounted at /home/agent starts
 #    empty on first use. The image carries a template of the fully set-up
@@ -19,7 +19,17 @@
 #    the copy entirely. Delete the marker (or the whole home) to force a
 #    re-seed.
 #
-# 2. Launch. The command is the container's CMD / first arguments:
+# 2. Map local LLM endpoints to the host-container hostname. Inside the
+#    container, localhost / 127.0.0.1 / ::1 is the container itself, not the
+#    Mac — so a loopback endpoint could never work as written. OPENAI_BASE_URL
+#    and the baseUrl entries of /home/agent/.pi/agent/models.json are
+#    checked independently; every URL whose host is loopback is rewritten to
+#    host.container.internal, which 'pcs start' / 'pcs shell' map back to the
+#    host's own 127.0.0.1. URLs pointing at any other host, domain, or IP
+#    (external APIs like OpenRouter, the VM gateway, ...) are left completely
+#    untouched.
+#
+# 3. Launch. The command is the container's CMD / first arguments:
 #       - "pi"    -> run 'pi update' and 'pi update --extensions' (so pi
 #                    and its extensions are always fresh), then cd into
 #                    /workspace (the mounted project folder) and exec pi
@@ -57,7 +67,39 @@ if [[ ! -f "${MARKER}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2) Launch.
+# 2) Map local LLM endpoints to the host-container hostname.
+# ---------------------------------------------------------------------------
+HOST_DNS_NAME="host.container.internal"
+
+# $1: URL -> prints it with a loopback host replaced by HOST_DNS_NAME
+# (port and path preserved); other hosts print unchanged.
+map_url_host() {
+  local url="${1:-}"
+  if [[ "${url}" =~ ^(https?://)(localhost|127\.0\.0\.1|::1)([:/].*)?$ ]]; then
+    printf '%s%s%s' "${BASH_REMATCH[1]}" "${HOST_DNS_NAME}" "${BASH_REMATCH[3]:-}"
+  else
+    printf '%s' "${url}"
+  fi
+}
+
+if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
+  mapped="$(map_url_host "${OPENAI_BASE_URL}")"
+  if [[ "${mapped}" != "${OPENAI_BASE_URL}" ]]; then
+    echo "sandbox: OPENAI_BASE_URL ${OPENAI_BASE_URL} -> ${mapped} (host-container hostname)" >&2
+    OPENAI_BASE_URL="${mapped}"
+    export OPENAI_BASE_URL
+  fi
+fi
+
+MODELS_JSON="${AGENT_HOME}/.pi/agent/models.json"
+if [[ -f "${MODELS_JSON}" ]] \
+  && grep -Eq '"baseUrl"[[:space:]]*:[[:space:]]*"https?://(localhost|127\.0\.0\.1|::1)([:/]|")' "${MODELS_JSON}"; then
+  sed -E -i 's#(https?://)(localhost|127\.0\.0\.1|::1)([:/])#\1'"${HOST_DNS_NAME}"'\3#g' "${MODELS_JSON}"
+  echo "sandbox: models.json loopback baseUrl(s) -> ${HOST_DNS_NAME}" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# 3) Launch.
 # ---------------------------------------------------------------------------
 case "${1:-}" in
   pi)

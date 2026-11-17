@@ -81,7 +81,7 @@ pcs_cmd_status() {
   if [[ -n "${PI_SANDBOX_QWEN_URL:-}" ]]; then
     echo "endpoint: ${PI_SANDBOX_QWEN_URL}"
   else
-    echo "endpoint: (not configured; set OPENAI_BASE_URL in config/sandbox.env)"
+    echo "endpoint: (not set; optional — models come from home-agent/.pi/agent/models.json)"
   fi
   echo "api key: $(pcs_redact "${OPENAI_API_KEY:-}")"
 }

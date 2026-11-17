@@ -91,6 +91,102 @@ readonly PCS_HOST_DNS_NAME
 PCS_AGENT_HOME_DIR="${PCS_REPO_ROOT}/home-agent"
 readonly PCS_AGENT_HOME_DIR
 
+# ---------------------------------------------------------------------------
+# LLM endpoint helpers.
+#
+# OPENAI_BASE_URL is optional: models can be defined entirely in the agent's
+# models.json. Inside the container, loopback (localhost / 127.0.0.1 / ::1)
+# is the container itself, not the Mac — so any URL pointing at the host
+# loopback (in OPENAI_BASE_URL or in a models.json baseUrl, checked
+# independently) is mapped to the synthetic container-domain hostname
+# PCS_HOST_DNS_NAME during start. URLs pointing at any other host, domain,
+# or IP (external APIs, the VM gateway, ...) are left untouched.
+# ---------------------------------------------------------------------------
+# The agent's models.json (bind-mounted from the host into the sandbox).
+# Overridable for tests; never readonly for that reason.
+PCS_MODELS_JSON_FILE="${PCS_MODELS_JSON_FILE:-${PCS_AGENT_HOME_DIR}/.pi/agent/models.json}"
+
+# Print the host of a URL: no scheme, user info, port, or path.
+pcs_url_host() {
+  local url="${1:-}"
+  local rest
+  rest="${url#*://}"   # drop scheme
+  rest="${rest%%/*}"   # drop path
+  rest="${rest%%\?*}"  # drop query
+  rest="${rest#*@}"    # drop user:pass@
+  # IPv6 loopback: the host starts with ':', so the port strip below would
+  # erase it (also covers the bracketed [::1] form).
+  case "${rest}" in
+    "::1"*|"[::1]"*) printf '%s\n' "::1"; return 0 ;;
+  esac
+  rest="${rest%%:*}"   # drop port
+  printf '%s\n' "${rest}"
+}
+
+# Returns 0 when the URL's host is loopback (localhost, 127.0.0.1, ::1).
+pcs_url_host_is_local() {
+  local host
+  host="$(pcs_url_host "${1:-}")"
+  case "${host}" in
+    localhost|127.0.0.1|::1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Print every "baseUrl" value of the agent's models.json, one per line.
+# Plain-text extraction: the file is small and hand-maintained. A missing
+# file simply prints nothing.
+# shellcheck disable=SC2120
+pcs_models_json_base_urls() {
+  local file="${1:-${PCS_MODELS_JSON_FILE}}"
+  [[ -f "${file}" ]] || return 0
+  sed -n 's/.*"baseUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${file}"
+}
+
+# Returns 0 when the host.container.internal localhost mapping is required:
+# OPENAI_BASE_URL (checked independently of models.json) or any models.json
+# baseUrl points at the host loopback or already at the synthetic name.
+# External / other hosts never trigger the mapping.
+pcs_config_needs_host_dns() {
+  local url
+
+  if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
+    if pcs_url_host_is_local "${OPENAI_BASE_URL}" || [[ "${OPENAI_BASE_URL}" == *"${PCS_HOST_DNS_NAME}"* ]]; then
+      return 0
+    fi
+  fi
+
+  while IFS= read -r url; do
+    [[ -n "${url}" ]] || continue
+    # shellcheck disable=SC2119
+    if pcs_url_host_is_local "${url}" || [[ "${url}" == *"${PCS_HOST_DNS_NAME}"* ]]; then
+      return 0
+    fi
+  done < <(pcs_models_json_base_urls)
+
+  return 1
+}
+
+# Rewrite the URL so a loopback host becomes the synthetic container-domain
+# hostname (port and path preserved). Any other host is printed unchanged.
+pcs_map_url_to_container_domain() {
+  local url="${1:-}"
+  local scheme rest host
+
+  if [[ "${url}" =~ ^(https?://) ]]; then
+    scheme="${BASH_REMATCH[1]}"
+    rest="${url#"${scheme}"}"
+    host="${rest%%[/:]*}"
+    case "${host}" in
+      localhost|127.0.0.1|::1)
+        printf '%s%s%s' "${scheme}" "${PCS_HOST_DNS_NAME}" "${rest:$((${#host}))}"
+        return 0
+        ;;
+    esac
+  fi
+  printf '%s' "${url}"
+}
+
 # Host directory bind-mounted (read-write) at /workspace. Supplied via
 # --workspace-source (canonical absolute path); resolved by
 # pcs_ensure_workspace_source().

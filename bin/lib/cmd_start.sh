@@ -58,14 +58,21 @@ Before starting, every extension listed in PI_SANDBOX_EXTENSIONS (see
 config/sandbox.env) is checked with 'pi list' inside the image and installed
 with 'pi install' if missing, so a fresh home-agent/ is self-repairing.
 
-If the configured endpoint (OPENAI_BASE_URL) uses the synthetic hostname
-host.container.internal, the Apple Container DNS entry is checked on every
-start. It is created or replaced only when it is missing, its IP is no longer
-safe on the current network, or the packet-filter redirect to 127.0.0.1 is
-not active (that rule is dropped on reboot and can go stale after a network
-change). sudo is used only for that create or replace. The sandbox still
-starts if the mapping cannot be repaired; the endpoint will simply be
-unreachable from inside.
+OPENAI_BASE_URL is optional: models may be defined entirely in
+home-agent/.pi/agent/models.json. On every start, OPENAI_BASE_URL and the
+baseUrl entries of models.json are checked independently. If any of them
+points at the host loopback (localhost / 127.0.0.1 / ::1) or already at the
+synthetic hostname host.container.internal, the Apple Container DNS entry
+for host.container.internal is checked: it is created or replaced only when
+it is missing, its IP is no longer safe on the current network, or the
+packet-filter redirect to 127.0.0.1 is not active (that rule is dropped on
+reboot and can go stale after a network change). sudo is used only for that
+create or replace. The container's entrypoint additionally rewrites such
+loopback URLs to host.container.internal (the environment variable for the
+session, the models.json lines in place). URLs pointing at any other host,
+domain, or IP (external APIs, the VM gateway) are left untouched. The
+sandbox still starts if the mapping cannot be repaired; the endpoint will
+simply be unreachable from inside.
 EOF
 }
 
@@ -473,15 +480,23 @@ pcs_cmd_start() {
   pcs_require_env_file
   pcs_load_env
 
+  # OPENAI_BASE_URL is optional: models may come entirely from
+  # home-agent/.pi/agent/models.json. Check it and the models.json baseUrls
+  # independently: if any of them points at the host loopback or already at
+  # the synthetic host-container hostname, the DNS mapping must work. The
+  # container entrypoint rewrites loopback URLs to ${PCS_HOST_DNS_NAME}
+  # itself. External / other-host URLs are never touched.
   if [[ -z "${OPENAI_BASE_URL:-}" ]]; then
-    pcs_warn "OPENAI_BASE_URL is not set in ${PCS_ENV_FILE}; Pi will not be able to reach the Qwen/oMLX endpoint."
-  elif [[ "${OPENAI_BASE_URL}" == *"${PCS_HOST_DNS_NAME}"* ]]; then
-    # The endpoint uses the synthetic host-container hostname. Repair the
-    # mapping only when it is missing or no longer a working localhost
-    # redirect. sudo is required only for that create or replace. Never
-    # fatal: the sandbox still starts, the endpoint just stays unreachable.
+    pcs_info "OPENAI_BASE_URL is not set (optional); models come from home-agent/.pi/agent/models.json."
+  fi
+  if pcs_config_needs_host_dns; then
+    # Repair the mapping only when it is missing or no longer a working
+    # localhost redirect. sudo is required only for that create or replace.
+    # Never fatal: the sandbox still starts, the endpoint just stays
+    # unreachable.
+    pcs_info "local LLM endpoint detected; ensuring the ${PCS_HOST_DNS_NAME} -> 127.0.0.1 host DNS mapping..."
     pcs_ensure_host_dns_mapping \
-      || pcs_warn "could not ensure the ${PCS_HOST_DNS_NAME} DNS mapping; the endpoint will not resolve inside the sandbox."
+      || pcs_warn "could not ensure the ${PCS_HOST_DNS_NAME} DNS mapping; the local endpoint will not resolve inside the sandbox."
   fi
 
   pcs_ensure_workspace_source "${WORKSPACE_SOURCE}" || exit 1
